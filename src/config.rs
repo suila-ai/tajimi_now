@@ -87,6 +87,49 @@ pub struct ChanceConfig {
     pub min_achieved_file: Option<String>,
 }
 
+impl ChanceConfig {
+    /// 予報の気温で添付するファイル。最高気温が `max_threshold` 以上なら `max_forecast_file`、
+    /// 最低気温が `min_threshold` 以下なら `min_forecast_file`。
+    pub fn forecast_files(&self, min: Option<f64>, max: f64) -> Vec<String> {
+        self.files(
+            min,
+            max,
+            self.max_forecast_file.as_ref(),
+            self.min_forecast_file.as_ref(),
+        )
+    }
+
+    /// 観測の気温で添付するファイル。判定は [`forecast_files`](Self::forecast_files) と同じ。
+    pub fn achieved_files(&self, min: f64, max: f64) -> Vec<String> {
+        self.files(
+            Some(min),
+            max,
+            self.max_achieved_file.as_ref(),
+            self.min_achieved_file.as_ref(),
+        )
+    }
+
+    fn files(
+        &self,
+        min: Option<f64>,
+        max: f64,
+        max_file: Option<&String>,
+        min_file: Option<&String>,
+    ) -> Vec<String> {
+        let hot = self.max_threshold.is_some_and(|threshold| max >= threshold);
+        let cold = min
+            .zip(self.min_threshold)
+            .is_some_and(|(min, threshold)| min <= threshold);
+        [max_file.filter(|_| hot), min_file.filter(|_| cold)]
+            .into_iter()
+            .flatten()
+            // 設定例のまま空文字を残した欄は、無いものとして扱う。空の ID を送ると、閾値に達した日だけ投稿が失敗し続ける。
+            .filter(|id| !id.is_empty())
+            .cloned()
+            .collect()
+    }
+}
+
 /// 本文への正規表現の置換。`replacement` には `$1` や `${name}` のような参照を書ける。
 /// 参照の直後に英数字が続くなら `${1}mm` のように波括弧で囲む（`$1mm` は `1mm` という名前の参照になり、空になる）。
 #[derive(Debug, Clone, Deserialize)]
@@ -313,6 +356,38 @@ replacement = '${{n}}mm'
             .parse::<Config>()
             .unwrap_err();
         assert!(error.to_string().contains("regex"), "{error}");
+    }
+
+    #[test]
+    fn chance_files_follow_the_thresholds() {
+        let chance = ChanceConfig {
+            max_threshold: Some(33.0),
+            max_forecast_file: Some("fh".to_owned()),
+            max_achieved_file: Some("ah".to_owned()),
+            min_threshold: Some(-5.0),
+            min_forecast_file: Some("fc".to_owned()),
+            min_achieved_file: None,
+        };
+        assert_eq!(chance.forecast_files(Some(-6.0), 34.0), ["fh", "fc"]);
+        // 閾値ちょうどは添付する。
+        assert_eq!(chance.forecast_files(Some(-5.0), 33.0), ["fh", "fc"]);
+        assert_eq!(
+            chance.forecast_files(Some(-4.9), 32.9),
+            Vec::<String>::new()
+        );
+        assert_eq!(chance.forecast_files(None, 33.5), ["fh"]);
+        assert_eq!(chance.achieved_files(-6.0, 34.0), ["ah"]);
+        assert!(
+            ChanceConfig::default()
+                .achieved_files(-50.0, 50.0)
+                .is_empty()
+        );
+        // 空文字の欄は添付しない。
+        let blank = ChanceConfig {
+            max_forecast_file: Some(String::new()),
+            ..chance
+        };
+        assert_eq!(blank.forecast_files(Some(-6.0), 34.0), ["fc"]);
     }
 
     #[test]

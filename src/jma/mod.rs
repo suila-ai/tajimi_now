@@ -297,7 +297,6 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::time::JST;
 
     const STATIONS: &str = include_str!("../../tests/fixtures/jma/amedastable.json");
     const BLOCK_21: &str = include_str!("../../tests/fixtures/jma/amedas_52606_20261022_21.json");
@@ -531,7 +530,7 @@ mod tests {
     async fn live_jma_amedas() {
         let jma = JmaClient::new(reqwest::Client::new());
         assert_eq!(jma.station_name("52606").await.unwrap(), "多治見");
-        let now = chrono::Utc::now().with_timezone(&JST);
+        let now = crate::time::now();
         // 直前の枠は出ていないことがあるので、20 分前の枠を見る。
         let slot = amedas::slot(now - TimeDelta::minutes(20));
         let observation = jma
@@ -558,7 +557,7 @@ mod tests {
         let jma = JmaClient::new(reqwest::Client::new());
         // 最新の発表の日の翌日なら、天気と最高気温がある。0〜5 時の最新は前日 17 時の発表なので、
         // 6 時間前の日の翌日（18 時間後の日）を見る。
-        let date = (chrono::Utc::now().with_timezone(&JST) + TimeDelta::hours(18)).date_naive();
+        let date = (crate::time::now() + TimeDelta::hours(18)).date_naive();
         let forecast = jma
             .daily_forecast("210000", "210010", date)
             .await
