@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod jma;
 mod time;
 
 use std::path::PathBuf;
