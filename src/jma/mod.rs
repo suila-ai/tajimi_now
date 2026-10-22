@@ -2,6 +2,7 @@
 
 pub mod amedas;
 pub mod forecast;
+pub mod warning;
 pub mod weather;
 
 use std::collections::HashMap;
@@ -12,6 +13,7 @@ use tokio::sync::OnceCell;
 
 pub use amedas::Observation;
 pub use forecast::DailyForecast;
+pub use warning::Kind;
 
 const ORIGIN: &str = "https://www.jma.go.jp";
 
@@ -35,6 +37,9 @@ pub trait Jma {
         area: &str,
         date: NaiveDate,
     ) -> Result<Option<DailyForecast>, Error>;
+    /// `office` が `area`（市区町村）に発表中の警報・注意報。[`warning::TABLE`] の順。
+    /// `area` が `office` の発表に無ければ [`Error::UnknownArea`]。
+    async fn active_warnings(&self, office: &str, area: &str) -> Result<Vec<Kind>, Error>;
 }
 
 /// 参照越しにも使えるようにする。1 つのクライアントを複数のジョブで共有するため。
@@ -58,6 +63,10 @@ impl<T: Jma> Jma for &T {
         date: NaiveDate,
     ) -> Result<Option<DailyForecast>, Error> {
         (**self).daily_forecast(office, area, date).await
+    }
+
+    async fn active_warnings(&self, office: &str, area: &str) -> Result<Vec<Kind>, Error> {
+        (**self).active_warnings(office, area).await
     }
 }
 
@@ -184,6 +193,18 @@ impl Jma for JmaClient {
         let table: forecast::AreaTable = self.fetch_required(forecast::AREAS_PATH).await?;
         Ok(forecast::daily(&reports, &table, area, date))
     }
+
+    async fn active_warnings(&self, office: &str, area: &str) -> Result<Vec<Kind>, Error> {
+        let reports: warning::Reports = self.fetch_required(&warning::path(office)).await?;
+        // 市区町村の誤りは、発表が無いのと同じ空の結果になるので、エラーにして気付けるようにする。
+        if !warning::covers(&reports, area) {
+            return Err(Error::UnknownArea {
+                office: office.to_owned(),
+                area: area.to_owned(),
+            });
+        }
+        Ok(warning::active(&reports, area))
+    }
 }
 
 /// ジョブのテストで使う、決まった結果を返す気象庁。
@@ -193,7 +214,7 @@ pub mod fake {
 
     use chrono::{NaiveDate, NaiveDateTime};
 
-    use super::{DailyForecast, Error, Jma, Observation};
+    use super::{DailyForecast, Error, Jma, Kind, Observation};
 
     /// 取得に失敗したことを表すエラー。
     pub fn fetch_error() -> Error {
@@ -210,6 +231,8 @@ pub mod fake {
         observations: BTreeMap<NaiveDateTime, Observation>,
         /// どの日を聞かれても返す予報。無ければ「まだ無い」。
         forecast: Option<DailyForecast>,
+        /// 発表中の警報・注意報。`None` なら取得に失敗する。
+        warnings: Option<Vec<Kind>>,
     }
 
     impl FakeJma {
@@ -229,6 +252,11 @@ pub mod fake {
 
         pub fn with_forecast(mut self, forecast: DailyForecast) -> Self {
             self.forecast = Some(forecast);
+            self
+        }
+
+        pub fn with_warnings(mut self, kinds: Vec<Kind>) -> Self {
+            self.warnings = Some(kinds);
             self
         }
     }
@@ -255,6 +283,10 @@ pub mod fake {
         ) -> Result<Option<DailyForecast>, Error> {
             Ok(self.forecast.clone())
         }
+
+        async fn active_warnings(&self, _office: &str, _area: &str) -> Result<Vec<Kind>, Error> {
+            self.warnings.clone().ok_or_else(fetch_error)
+        }
     }
 }
 
@@ -271,6 +303,7 @@ mod tests {
     const BLOCK_21: &str = include_str!("../../tests/fixtures/jma/amedas_52606_20261022_21.json");
     const AREAS: &str = include_str!("../../tests/fixtures/jma/forecast_area.json");
     const FORECAST: &str = include_str!("../../tests/fixtures/jma/forecast_210000_1700.json");
+    const WARNING: &str = include_str!("../../tests/fixtures/jma/warning_474000.json");
 
     async fn mount(server: &MockServer, url_path: &str, body: &str, expect: u64) {
         Mock::given(method("GET"))
@@ -433,6 +466,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::UnknownArea { .. }), "{error}");
+
+        // 別の気象台の市区町村。
+        mount(&server, "/bosai/warning/data/r8/474000.json", WARNING, 1).await;
+        let error = jma.active_warnings("474000", "2120400").await.unwrap_err();
+        assert!(matches!(error, Error::UnknownArea { .. }), "{error}");
     }
 
     #[tokio::test]
@@ -464,6 +502,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_warnings_are_read_from_the_office_file() {
+        let server = MockServer::start().await;
+        mount(&server, "/bosai/warning/data/r8/474000.json", WARNING, 1).await;
+        let jma = JmaClient::with_origin(reqwest::Client::new(), &server.uri());
+        let kinds = jma.active_warnings("474000", "4738100").await.unwrap();
+        assert_eq!(kinds.len(), 6);
+        assert_eq!(kinds[0].code, "10");
+    }
+
+    #[tokio::test]
     async fn a_missing_office_file_is_an_error() {
         let server = MockServer::start().await;
         let jma = JmaClient::with_origin(reqwest::Client::new(), &server.uri());
@@ -472,6 +520,8 @@ mod tests {
             .daily_forecast("210000", "210010", date)
             .await
             .unwrap_err();
+        assert!(matches!(error, Error::NotFound { .. }), "{error}");
+        let error = jma.active_warnings("210000", "2120400").await.unwrap_err();
         assert!(matches!(error, Error::NotFound { .. }), "{error}");
     }
 
@@ -516,5 +566,14 @@ mod tests {
             .expect("the forecast for the day after the latest report");
         assert_eq!(forecast.area_name, "美濃地方");
         assert!(weather::Weather::from_code(forecast.weather_code).is_some());
+    }
+
+    /// 実際の気象庁のサイトに対する取得。手で実行する。発表中の種別は日によって違うので、読めることだけを見る。
+    #[tokio::test]
+    #[ignore = "needs network access to www.jma.go.jp"]
+    async fn live_jma_warnings() {
+        let jma = JmaClient::new(reqwest::Client::new());
+        let kinds = jma.active_warnings("210000", "2120400").await.unwrap();
+        assert!(kinds.iter().all(|kind| warning::TABLE.contains(kind)));
     }
 }
