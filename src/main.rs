@@ -5,6 +5,7 @@
 
 mod config;
 mod jma;
+mod mfm;
 mod time;
 
 use std::path::PathBuf;
