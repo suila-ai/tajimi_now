@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    restart: always
+    # init を PID 1 にする。bot が PID 1 だと、シグナルの待ち受けを始める前（Misskey への接続中など）に届いた SIGTERM が無視され、stop_grace_period の 6 分が過ぎるまで止まらない
+    init: true
+    # 停止時は、実行中の 1 回（最長 5 分の RUN_TIMEOUT）が終わるまで待つ。既定の 10 秒では、投稿と pin の間で強制終了されうる
+    stop_grace_period: 6m
+    volumes:
+      # 設定。config.example.toml を写して書く。トークンを含むのでコミットしない
+      # 長い書式で create_host_path を切るのは、ファイルが無いまま起動したときに、Docker がその場所にディレクトリを作らず、エラーで止めるため
+      - type: bind
+        source: ./config.toml
+        target: /app/config.toml
+        read_only: true
+        bind:
+          create_host_path: false

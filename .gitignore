@@ -1,1 +1,5 @@
 /target
+
+# 実行時の設定。トークンを含むのでコミットしない
+config.toml
+scripts/misskey/.env.local
