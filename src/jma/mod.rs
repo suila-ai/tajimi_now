@@ -1,14 +1,17 @@
 //! 気象庁の公開データ（`https://www.jma.go.jp/bosai/`）の取得。
 
 pub mod amedas;
+pub mod forecast;
+pub mod weather;
 
 use std::collections::HashMap;
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::de::DeserializeOwned;
 use tokio::sync::OnceCell;
 
 pub use amedas::Observation;
+pub use forecast::DailyForecast;
 
 const ORIGIN: &str = "https://www.jma.go.jp";
 
@@ -24,6 +27,14 @@ pub trait Jma {
         point: &str,
         slot: NaiveDateTime,
     ) -> Result<Option<Observation>, Error>;
+    /// `office` が発表する `area`（一次細分区域）の `date` の予報。天気・降水確率・最高気温がまだ無ければ `None`。
+    /// `area` が `office` の発表に無ければ [`Error::UnknownArea`]。
+    async fn daily_forecast(
+        &self,
+        office: &str,
+        area: &str,
+        date: NaiveDate,
+    ) -> Result<Option<DailyForecast>, Error>;
 }
 
 /// 参照越しにも使えるようにする。1 つのクライアントを複数のジョブで共有するため。
@@ -38,6 +49,15 @@ impl<T: Jma> Jma for &T {
         slot: NaiveDateTime,
     ) -> Result<Option<Observation>, Error> {
         (**self).observation_at(point, slot).await
+    }
+
+    async fn daily_forecast(
+        &self,
+        office: &str,
+        area: &str,
+        date: NaiveDate,
+    ) -> Result<Option<DailyForecast>, Error> {
+        (**self).daily_forecast(office, area, date).await
     }
 }
 
@@ -59,6 +79,8 @@ pub enum Error {
     NotFound { url: String },
     #[error("unknown AMeDAS station {point}")]
     UnknownStation { point: String },
+    #[error("area {area} is not in the reports of office {office}")]
+    UnknownArea { office: String, area: String },
 }
 
 /// 気象庁のサイトを叩く実装。
@@ -142,6 +164,26 @@ impl Jma for JmaClient {
         };
         Ok(amedas::observation(&block, slot))
     }
+
+    async fn daily_forecast(
+        &self,
+        office: &str,
+        area: &str,
+        date: NaiveDate,
+    ) -> Result<Option<DailyForecast>, Error> {
+        let reports: forecast::Reports = self.fetch_required(&forecast::path(office)).await?;
+        // 区域が無いのも予報がまだ無いのも `daily` では `None` になり、コードを誤ると黙って投稿しなくなるので、分けてエラーにする。
+        if !forecast::covers(&reports, area) {
+            return Err(Error::UnknownArea {
+                office: office.to_owned(),
+                area: area.to_owned(),
+            });
+        }
+        // 対応表は使い回さず、毎回取る。使い回すと、気象庁が区域の気温の地点を差し替えたときに、再起動するまで気温が引けず、
+        // 予報が黙って止まる。引くのはその日の予報を投稿するまでの間（ふだんは 0 時台の 1 回）だけなので、毎回取っても負担は無い。
+        let table: forecast::AreaTable = self.fetch_required(forecast::AREAS_PATH).await?;
+        Ok(forecast::daily(&reports, &table, area, date))
+    }
 }
 
 /// ジョブのテストで使う、決まった結果を返す気象庁。
@@ -149,9 +191,9 @@ impl Jma for JmaClient {
 pub mod fake {
     use std::collections::BTreeMap;
 
-    use chrono::NaiveDateTime;
+    use chrono::{NaiveDate, NaiveDateTime};
 
-    use super::{Error, Jma, Observation};
+    use super::{DailyForecast, Error, Jma, Observation};
 
     /// 取得に失敗したことを表すエラー。
     pub fn fetch_error() -> Error {
@@ -166,6 +208,8 @@ pub mod fake {
         station: Option<String>,
         /// 10 分枠ごとの観測値。
         observations: BTreeMap<NaiveDateTime, Observation>,
+        /// どの日を聞かれても返す予報。無ければ「まだ無い」。
+        forecast: Option<DailyForecast>,
     }
 
     impl FakeJma {
@@ -180,6 +224,11 @@ pub mod fake {
 
         pub fn with_observation(mut self, observation: Observation) -> Self {
             self.observations.insert(observation.time, observation);
+            self
+        }
+
+        pub fn with_forecast(mut self, forecast: DailyForecast) -> Self {
+            self.forecast = Some(forecast);
             self
         }
     }
@@ -197,6 +246,15 @@ pub mod fake {
             self.station.as_ref().ok_or_else(fetch_error)?;
             Ok(self.observations.get(&slot).cloned())
         }
+
+        async fn daily_forecast(
+            &self,
+            _office: &str,
+            _area: &str,
+            _date: NaiveDate,
+        ) -> Result<Option<DailyForecast>, Error> {
+            Ok(self.forecast.clone())
+        }
     }
 }
 
@@ -211,6 +269,8 @@ mod tests {
 
     const STATIONS: &str = include_str!("../../tests/fixtures/jma/amedastable.json");
     const BLOCK_21: &str = include_str!("../../tests/fixtures/jma/amedas_52606_20261022_21.json");
+    const AREAS: &str = include_str!("../../tests/fixtures/jma/forecast_area.json");
+    const FORECAST: &str = include_str!("../../tests/fixtures/jma/forecast_210000_1700.json");
 
     async fn mount(server: &MockServer, url_path: &str, body: &str, expect: u64) {
         Mock::given(method("GET"))
@@ -244,6 +304,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::UnknownStation { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_area_table_is_fetched_on_each_call() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/bosai/forecast/data/forecast/210000.json",
+            FORECAST,
+            2,
+        )
+        .await;
+        mount(
+            &server,
+            "/bosai/forecast/const/forecast_area.json",
+            AREAS,
+            2,
+        )
+        .await;
+        let jma = JmaClient::with_origin(reqwest::Client::new(), &server.uri());
+        let date = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+        for _ in 0..2 {
+            assert!(
+                jma.daily_forecast("210000", "210010", date)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]
@@ -326,6 +415,66 @@ mod tests {
         assert!(matches!(error, Error::Parse { .. }), "{error}");
     }
 
+    #[tokio::test]
+    async fn an_area_outside_the_office_is_an_error() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/bosai/forecast/data/forecast/210000.json",
+            FORECAST,
+            1,
+        )
+        .await;
+        // 区域の対応表は mount しない。区域の確認が表の取得より前にあることも確かめる。
+        let jma = JmaClient::with_origin(reqwest::Client::new(), &server.uri());
+        let date = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+        let error = jma
+            .daily_forecast("210000", "130010", date)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::UnknownArea { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn daily_forecast_is_read_from_the_office_file() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/bosai/forecast/data/forecast/210000.json",
+            FORECAST,
+            1,
+        )
+        .await;
+        mount(
+            &server,
+            "/bosai/forecast/const/forecast_area.json",
+            AREAS,
+            1,
+        )
+        .await;
+        let jma = JmaClient::with_origin(reqwest::Client::new(), &server.uri());
+        let date = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+        let forecast = jma
+            .daily_forecast("210000", "210010", date)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forecast.area_name, "美濃地方");
+        assert_eq!(forecast.max_temperature, 22);
+    }
+
+    #[tokio::test]
+    async fn a_missing_office_file_is_an_error() {
+        let server = MockServer::start().await;
+        let jma = JmaClient::with_origin(reqwest::Client::new(), &server.uri());
+        let date = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+        let error = jma
+            .daily_forecast("210000", "210010", date)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotFound { .. }), "{error}");
+    }
+
     /// 実際の気象庁のサイトに対する取得。手で実行する。
     #[tokio::test]
     #[ignore = "needs network access to www.jma.go.jp"]
@@ -350,5 +499,22 @@ mod tests {
             .expect("the 24:00 slot of yesterday");
         assert!(observation.max_temperature.is_some(), "{observation:?}");
         assert!(observation.min_temperature.is_some(), "{observation:?}");
+    }
+
+    /// 実際の気象庁のサイトに対する取得。手で実行する。
+    #[tokio::test]
+    #[ignore = "needs network access to www.jma.go.jp"]
+    async fn live_jma_forecast() {
+        let jma = JmaClient::new(reqwest::Client::new());
+        // 最新の発表の日の翌日なら、天気と最高気温がある。0〜5 時の最新は前日 17 時の発表なので、
+        // 6 時間前の日の翌日（18 時間後の日）を見る。
+        let date = (chrono::Utc::now().with_timezone(&JST) + TimeDelta::hours(18)).date_naive();
+        let forecast = jma
+            .daily_forecast("210000", "210010", date)
+            .await
+            .unwrap()
+            .expect("the forecast for the day after the latest report");
+        assert_eq!(forecast.area_name, "美濃地方");
+        assert!(weather::Weather::from_code(forecast.weather_code).is_some());
     }
 }
