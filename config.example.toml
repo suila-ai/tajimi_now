@@ -1,0 +1,46 @@
+# tajimi_now の設定。config.toml に写して書き換える。コメントの URL は気象庁の公開データで、コードはそのキーを使う。
+
+[misskey]
+# サーバのベース URL とアクセストークン。トークンには read:account、write:account、write:notes の権限が要る
+server = "https://misskey.example.com"
+token = ""
+
+# アメダス。節を省くと、観測値（10 分ごと）と前日の気温（日次）を投稿しない
+[amedas]
+# 地点コード。https://www.jma.go.jp/bosai/amedas/const/amedastable.json のキー
+point = "52606"
+# ノートの公開範囲（public / home / followers / specified）。省くと home。specified は宛先を付けずに送り、自分だけが読めるノートにする
+observation_visibility = "home"
+min_max_visibility = "public"
+
+# 天気予報（日次、ピン留め）。節を省くと投稿しない
+[forecast]
+# 予報を発表する気象台のコード（https://www.jma.go.jp/bosai/forecast/data/forecast/{office}.json）。
+# ふつうは https://www.jma.go.jp/bosai/common/const/area.json の offices のキーで、十勝（014030）は 014100、奄美（460040）は 460100
+office = "210000"
+# 一次細分区域のコード。area.json の class10s のキー
+area = "210010"
+visibility = "public"
+
+# 観測値に添える警報・注意報。節を省くと添えない
+[warning]
+office = "210000"
+# 市区町村のコード。area.json の class20s のキー
+area = "2120400"
+
+# 任意。気温の閾値と、達したときに添付するドライブのファイル ID（通称「多治見チャンス」）
+#[chance]
+# 予報か観測の最高気温がこれ以上なら添付する
+#max_threshold = 35.3
+#max_forecast_file = ""
+#max_achieved_file = ""
+# 最低気温がこれ以下なら添付する
+#min_threshold = -5.3
+#min_forecast_file = ""
+#min_achieved_file = ""
+
+# 任意。本文（ヘッダとフッタ以外）に順に当てる正規表現の置換。replacement には $1 や ${name} のような参照を書ける。
+# 参照の直後に英数字が続くなら ${1}mm のように波括弧で囲む（$1mm は 1mm という名前の参照になり、空になる）
+#[[replace]]
+#pattern = '33\.4 ℃'
+#replacement = ':334:$[fg.color=595959 $[position.x=-0.9,y=0.14 .]]℃'
